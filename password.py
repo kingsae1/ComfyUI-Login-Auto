@@ -21,6 +21,9 @@ login_html_path = os.path.join(node_dir, "login.html")
 KEY_AGE_LIMIT = timedelta(days=30)  # Key expiration period
 TOKEN = ""
 
+# 허용된 IP 목록 (동적으로 추가될 IP를 저장)
+ALLOWED_IPS = set()
+
 # Global cache dictionary
 user_cache = {}
 
@@ -106,7 +109,7 @@ async def login_handler(request):
     data = await request.post()
     username_input = data.get('username')
     password_input = data.get('password').encode('utf-8')
-    guest_mode = data.get('guest_mode')=='1'
+    guest_mode = data.get('guest_mode') == '1'
 
     if guest_mode and os.path.exists(guest_mode_path):
         session = await get_session(request)
@@ -114,25 +117,31 @@ async def login_handler(request):
         return web.HTTPFound('/')
 
     if os.path.exists(password_path):
-        # Existing user login attempt
+        # 기존 사용자 로그인 시도
         username_cached, password_cached = get_user_data()
         if password_cached and bcrypt.checkpw(password_input, password_cached):
-            # Password is correct
+            # 비밀번호가 맞는 경우
             session = await get_session(request)
             session['logged_in'] = True
             if username_cached:
                 session['username'] = username_cached
             else:
-                # Username needs to be added because it does not exist
+                # 사용자 이름이 없으므로 추가
                 with open(password_path, "wb") as file:
                     file.write(password_cached + b'\n' + username_input.encode('utf-8'))
                 user_cache['username'] = username_input
                 session['username'] = username_input
-            return web.HTTPFound('/')  # Redirect to the main page if the password is correct
+
+            # 로그인 성공 시 요청 IP를 허용된 목록에 추가
+            client_ip = request.remote
+            ALLOWED_IPS.add(client_ip)
+            logging.info(f"Added IP to allowed list: {client_ip}")
+
+            return web.HTTPFound('/')  # 비밀번호가 맞으면 메인 페이지로 리디렉션
         else:
             return web.HTTPFound('/login?wrong_password=1')
     else:
-        # New user setup
+        # 새로운 사용자 설정
         salt = bcrypt.gensalt()
         hashed_password = bcrypt.hashpw(password_input, salt)
         with open(password_path, "wb") as file:
@@ -142,8 +151,14 @@ async def login_handler(request):
         session = await get_session(request)
         session['logged_in'] = True
         session['username'] = username_input
+
+        # 로그인 성공 시 요청 IP를 허용된 목록에 추가
+        client_ip = request.remote
+        ALLOWED_IPS.add(client_ip)
+        logging.info(f"Added IP to allowed list: {client_ip}")
+
         return web.HTTPFound('/')
-    return web.HTTPFound('/login') # will not be reached
+    return web.HTTPFound('/login')  # 도달하지 않음
 
 @routes.get("/logout")
 async def get_root(request):
@@ -186,9 +201,22 @@ if os.path.exists(old_password_path):
 load_token()
 
 async def process_request(request, handler):
-    """Process the request by calling the handler and setting response headers."""
+    """Process the request by checking IP or token, and calling the handler."""
+    # 토큰이 유효한 경우 IP 체크 없이 요청 처리
+    if TOKEN != "" and request.query.get("token") == TOKEN:
+        return await handler(request)
+
+    # 요청의 IP 주소 확인
+    client_ip = request.remote
+
+    # 허용된 IP 목록에 없는 경우 로그인 페이지로 리디렉션
+    if client_ip not in ALLOWED_IPS:
+        logging.warning(f"Unauthorized access attempt from IP: {client_ip}")
+        raise web.HTTPFound('/login')
+
+    # IP가 허용된 경우, 핸들러 실행
     response = await handler(request)
-    if request.path == '/':  # Prevent caching the main page after logout
+    if request.path == '/':  # 로그아웃 후 메인 페이지 캐싱 방지
         response.headers.setdefault('Cache-Control', 'no-cache')
     return response
 
