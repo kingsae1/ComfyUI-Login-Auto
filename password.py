@@ -11,42 +11,108 @@ import folder_paths
 import bcrypt
 from datetime import datetime, timedelta
 import logging
+import sqlite3
+from contextlib import contextmanager
 
+# 파일 경로 설정
 node_dir = os.path.dirname(__file__)
 comfy_dir = os.path.dirname(folder_paths.__file__)
 password_path = os.path.join(comfy_dir, "login", "PASSWORD")
 guest_mode_path = os.path.join(comfy_dir, "login", "GUEST_MODE")
-secret_key_path = os.path.join(node_dir,'.secret-key.txt')
+secret_key_path = os.path.join(node_dir, '.secret-key.txt')
 login_html_path = os.path.join(node_dir, "login.html")
-KEY_AGE_LIMIT = timedelta(days=30)  # Key expiration period
+DATABASE_PATH = os.path.join(comfy_dir, "login", "users.db")  # SQLite 데이터베이스 경로
+
+# 상수 설정
+KEY_AGE_LIMIT = timedelta(days=30)  # 키 만료 기간
 TOKEN = ""
 
-# 허용된 IP 목록 (동적으로 추가될 IP를 저장)
-ALLOWED_IPS = set()
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
 
-# Global cache dictionary
-user_cache = {}
+# SQLite 데이터베이스 연결 관리
+@contextmanager
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row  # 딕셔너리 형태로 결과 반환
+    try:
+        yield conn
+    finally:
+        conn.close()
 
-def get_user_data():
-    if 'username' in user_cache:
-        return user_cache['username'], user_cache['password']
-    else:
-        if os.path.exists(password_path):
-            with open(password_path, "rb") as f:
-                stored_data = f.read().split(b'\n')
-                password = stored_data[0]
-                user_cache['password'] = password
-                if len(stored_data) > 1 and stored_data[1].strip():
-                    # Username exists in the second line
-                    username = stored_data[1].decode('utf-8').strip()
-                else:
-                    # No username present, use a placeholder and prompt for update
-                    username = None
-                user_cache['username'] = username
-                return username, password
-        return None, None
+# 데이터베이스 초기화
+def init_db():
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL
+            )
+        ''')
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                user_id INTEGER,
+                logged_in INTEGER DEFAULT 0,
+                guest_mode INTEGER DEFAULT 0,
+                FOREIGN KEY(user_id) REFERENCES users(id)
+            )
+        ''')
+        conn.commit()
 
+# 데이터베이스 초기화 실행
+init_db()
 
+# 사용자 추가 함수
+def add_user(username, password):
+    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO users (username, password) VALUES (?, ?)', (username, hashed_password))
+        conn.commit()
+
+# 사용자 조회 함수
+def get_user(username):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT id, username, password FROM users WHERE username = ?', (username,))
+        return cursor.fetchone()
+
+# 세션 생성 함수
+def create_session(session_id, user_id, logged_in=False, guest_mode=False):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('INSERT INTO sessions (session_id, user_id, logged_in, guest_mode) VALUES (?, ?, ?, ?)', 
+                       (session_id, user_id, logged_in, guest_mode))
+        conn.commit()
+
+# 세션 정보 조회 함수
+def get_session_info(session_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT session_id, user_id, logged_in, guest_mode FROM sessions WHERE session_id = ?', (session_id,))
+        return cursor.fetchone()
+
+# 세션 업데이트 함수
+def update_session(session_id, logged_in=None, guest_mode=None):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        if logged_in is not None:
+            cursor.execute('UPDATE sessions SET logged_in = ? WHERE session_id = ?', (logged_in, session_id))
+        if guest_mode is not None:
+            cursor.execute('UPDATE sessions SET guest_mode = ? WHERE session_id = ?', (guest_mode, session_id))
+        conn.commit()
+
+# 세션 삭제 함수
+def delete_session(session_id):
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM sessions WHERE session_id = ?', (session_id,))
+        conn.commit()
+
+# 키 생성 및 관리 함수
 def generate_key():
     return base64.urlsafe_b64encode(os.urandom(32)).decode('utf-8')
 
@@ -72,14 +138,16 @@ def get_or_refresh_key():
         write_key_to_file(key)
     return key
 
-# Access the PromptServer instance and its app
+# PromptServer 및 app 설정
 prompt_server = server.PromptServer.instance
 app = prompt_server.app
 routes = prompt_server.routes
 
+# 세션 설정
 secret_key = get_or_refresh_key()
 setup(app, EncryptedCookieStorage(secret_key))
 
+# 로그인 페이지
 @routes.get("/login")
 async def get_root(request):
     session = await get_session(request)
@@ -89,21 +157,15 @@ async def get_root(request):
     else:
         env = Environment(
             loader=FileSystemLoader(node_dir),
-            autoescape=select_autoescape(['html', 'xml'])
+            autoescape=select_autoescape(['html', 'xml']),
+            cache_size=0  # 캐시 비활성화
         )
         template = env.get_template('login.html')
-        first_time = not os.path.exists(password_path)
-        username, _ = get_user_data() if not first_time else (None, None)
-        prompt_for_username = False
-
-        if username is None and not first_time:
-            # If there's no username but it's not the first time, prompt for username
-            prompt_for_username = True
-
+        env.cache.clear()  # 캐시 초기화
         guest_mode = os.path.exists(guest_mode_path)
+        return web.Response(text=template.render(wrong_password=wrong_password, guest_mode=guest_mode), content_type='text/html')
 
-        return web.Response(text=template.render(first_time=first_time, username=username, wrong_password=wrong_password, prompt_for_username=prompt_for_username, guest_mode=guest_mode), content_type='text/html')
-
+# 로그인 처리
 @routes.post("/login")
 async def login_handler(request):
     data = await request.post()
@@ -116,60 +178,34 @@ async def login_handler(request):
         session['guest_mode'] = True
         return web.HTTPFound('/')
 
-    if os.path.exists(password_path):
-        # 기존 사용자 로그인 시도
-        username_cached, password_cached = get_user_data()
-        if password_cached and bcrypt.checkpw(password_input, password_cached):
-            # 비밀번호가 맞는 경우
+    user = get_user(username_input)
+    if user:
+        user_id, username, hashed_password = user
+        if bcrypt.checkpw(password_input, hashed_password):
             session = await get_session(request)
+            session_id = session.identity
+            create_session(session_id, user_id, logged_in=True)
             session['logged_in'] = True
-            if username_cached:
-                session['username'] = username_cached
-            else:
-                # 사용자 이름이 없으므로 추가
-                with open(password_path, "wb") as file:
-                    file.write(password_cached + b'\n' + username_input.encode('utf-8'))
-                user_cache['username'] = username_input
-                session['username'] = username_input
-
-            # 로그인 성공 시 요청 IP를 허용된 목록에 추가
-            client_ip = request.remote
-            ALLOWED_IPS.add(client_ip)
-            logging.info(f"Added IP to allowed list: {client_ip}")
-
-            return web.HTTPFound('/')  # 비밀번호가 맞으면 메인 페이지로 리디렉션
+            session['username'] = username
+            return web.HTTPFound('/')
         else:
             return web.HTTPFound('/login?wrong_password=1')
     else:
-        # 새로운 사용자 설정
-        salt = bcrypt.gensalt()
-        hashed_password = bcrypt.hashpw(password_input, salt)
-        with open(password_path, "wb") as file:
-            file.write(hashed_password + b'\n' + username_input.encode('utf-8'))
-        user_cache['username'] = username_input
-        user_cache['password'] = hashed_password
-        session = await get_session(request)
-        session['logged_in'] = True
-        session['username'] = username_input
+        return web.HTTPFound('/login?wrong_password=1')
 
-        # 로그인 성공 시 요청 IP를 허용된 목록에 추가
-        client_ip = request.remote
-        ALLOWED_IPS.add(client_ip)
-        logging.info(f"Added IP to allowed list: {client_ip}")
-
-        return web.HTTPFound('/')
-    return web.HTTPFound('/login')  # 도달하지 않음
-
+# 로그아웃 처리
 @routes.get("/logout")
 async def get_root(request):
     session = await get_session(request)
+    session_id = session.identity
+    delete_session(session_id)
     session['logged_in'] = False
     session['guest_mode'] = False
-    session.pop('username', None)  # Clear the username
-    session.pop('guest_mode', None)  # Clear the username
-    response = web.HTTPFound('/login')  # Redirect to the main page if the password is correct
+    session.pop('username', None)
+    response = web.HTTPFound('/login')
     return response
 
+# 게스트 모드 확인
 @routes.get("/guest_mode")
 async def get_guest_mode(request):
     session = await get_session(request)
@@ -177,102 +213,94 @@ async def get_guest_mode(request):
         return web.json_response({'guestMode': True})
     else:
         return web.json_response({'guestMode': False})
-    
-def load_token():
-    global TOKEN
-    try:
-        with open(password_path, "r", encoding="utf-8") as f:
-            TOKEN = f.readline().strip()  # Read only the first line and strip any newline characters
-            logging.info(f"For direct API calls, use token={TOKEN}")
-    except FileNotFoundError as e:
-        logging.error("Please set up your password before use. The token will be a hashed string derived from your password.")
-        TOKEN = ""
 
-if not os.path.exists(os.path.dirname(password_path)):
-    logging.info("Password directory does not exists, creating...")
-    os.makedirs(os.path.dirname(password_path))
+@routes.get("/register")
+async def get_register(request):
+    env = Environment(
+        loader=FileSystemLoader(node_dir),
+        autoescape=select_autoescape(['html', 'xml'])
+    )
+    template = env.get_template('register.html')  # register.html 파일 필요
+    return web.Response(text=template.render(), content_type='text/html')
 
-# Backward compatibility
-# Move PASSWORD file in login folder
-old_password_path = os.path.join(comfy_dir, "PASSWORD")
-if os.path.exists(old_password_path):
-    os.rename(old_password_path, password_path)
+@routes.post("/register")
+async def register_handler(request):
+    data = await request.post()
+    username = data.get('username')
+    password = data.get('password')
 
-load_token()
+    if not username or not password:
+        return web.HTTPFound('/register?error=1')  # 필수 필드 누락 시 에러
 
-async def process_request(request, handler):
-    """Process the request by checking IP or token, and calling the handler."""
-    # 토큰이 유효한 경우 IP 체크 없이 요청 처리
-    if TOKEN != "" and request.query.get("token") == TOKEN:
-        return await handler(request)
+    # 사용자 이름 중복 확인
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute('SELECT id FROM users WHERE username = ?', (username,))
+        if cursor.fetchone():
+            return web.HTTPFound('/register?error=2')  # 중복 사용자 이름
 
-    # 요청의 IP 주소 확인
-    client_ip = request.remote
+    # 사용자 추가
+    add_user(username, password)
+    return web.HTTPFound('/login')  # 로그인 페이지로 리디렉션
 
-    # 허용된 IP 목록에 없는 경우 로그인 페이지로 리디렉션
-    if client_ip not in ALLOWED_IPS:
-        logging.warning(f"Unauthorized access attempt from IP: {client_ip}")
-        raise web.HTTPFound('/login')
-
-    # IP가 허용된 경우, 핸들러 실행
-    response = await handler(request)
-    if request.path == '/':  # 로그아웃 후 메인 페이지 캐싱 방지
-        response.headers.setdefault('Cache-Control', 'no-cache')
-    return response
-
+# 미들웨어: 로그인 상태 확인
 @web.middleware
 async def check_login_status(request: web.Request, handler):
-    # Skip authentication for specific paths
-    if request.path == '/login' or request.path.endswith('.css') or request.path.endswith('.css.map') or request.path.endswith('.js') or request.path.endswith('.ico'):
+    # 예외 경로: 로그인, 회원가입, 정적 파일 등
+    excluded_paths = [
+        '/login',
+        '/register',  # 회원가입 페이지 추가
+        '/static',    # 정적 파일 경로 (필요한 경우)
+    ]
+
+    # 현재 요청 경로가 예외 경로인지 확인
+    if any(request.path.startswith(path) for path in excluded_paths):
         return await handler(request)
 
-    # Load the token if not already loaded
-    if TOKEN == "":
-        load_token()
-
-    # Get the session and check if logged in
+    # 세션 확인
     session = await get_session(request)
-    if 'logged_in' in session and session['logged_in']:
-        # User is logged in via session, proceed without checking tokens
+    session_id = session.identity
+    session_info = get_session_info(session_id)
+
+    # 로그인 상태 확인
+    if session_info and session_info['logged_in']:
         return await process_request(request, handler)
 
-    if 'guest_mode' in session and session['guest_mode']:
-        not_allowed_get_path = [
-        ]
-        allowed_post_path = [
-            '/prompt',
-            '/upload/image',
-        ]
-        if request.method=="GET" and not request.path in not_allowed_get_path:
+    # 게스트 모드 확인
+    if session_info and session_info['guest_mode']:
+        not_allowed_get_path = []
+        allowed_post_path = ['/prompt', '/upload/image']
+        if request.method == "GET" and request.path not in not_allowed_get_path:
             return await process_request(request, handler)
-        elif request.method=="POST" and request.path in allowed_post_path:
+        elif request.method == "POST" and request.path in allowed_post_path:
             return await process_request(request, handler)
         else:
             return web.json_response({})
 
-    # Check the Authorization header for Bearer token
+    # 토큰 기반 인증 확인
     if args.enable_cors_header is None or args.enable_cors_header == '*' or args.enable_cors_header == request.headers.get('Origin'):
         authorization_header = request.headers.get("Authorization")
         if authorization_header:
             auth_type, token_from_header = authorization_header.split()
             if auth_type == 'Bearer' and token_from_header == TOKEN:
-                # Bearer token is valid, proceed without checking query token
                 return await process_request(request, handler)
 
-        # Fallback to check the token in the query
         if request.query.get("token") == TOKEN:
             return await process_request(request, handler)
 
-    # unauthorized access
+    # 로그인되지 않은 경우 리디렉션
     accept_header = request.headers.get('Accept', '')
     if 'text/html' in accept_header:
         raise web.HTTPFound('/login')
     else:
         return web.json_response({'error': 'Authentication required.'}, status=401)
 
+# 미들웨어 추가
 app.middlewares.append(check_login_status)
 
+# 정적 파일 서빙
 old_css_path = os.path.join(node_dir, "old_css")
 app.router.add_static('/old_css/', old_css_path)
 
+# 노드 클래스 매핑 (필요한 경우 추가)
 NODE_CLASS_MAPPINGS = {}
